@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Personal files created while using the app (not part of the project)
+settings.json
+settings.json.tmp
+hydra_buddy.log
+reminder.wav
+
+# Editors and Windows
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

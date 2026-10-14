@@ -1,0 +1,32 @@
+{
+  "interval_minutes": 20,
+  "snooze_enabled": true,
+  "snooze_minutes": 5,
+  "eye_break_seconds": 20,
+  "sound_enabled": true,
+  "sound_volume": 0.6,
+  "theme": "cute",
+  "show_mascot": true,
+  "mascot_image": "",
+  "heading": "Hey! Time for a little self-care",
+  "subheading": "Take care of your eyes & body",
+  "closing_message": "Your eyes and body deserve a break!",
+  "reminders": {
+    "water": {
+      "enabled": true,
+      "title": "Drink Water",
+      "text": "Take a few sips of water. Stay hydrated."
+    },
+    "look_far": {
+      "enabled": true,
+      "title": "Look Far — {seconds} Seconds",
+      "text": "Look at something about 20 feet (6 metres) away. Relax your eyes and blink normally."
+    },
+    "move": {
+      "enabled": true,
+      "title": "Stand & Sit",
+      "text": "Stand up, stretch gently and move a little. Sit back comfortably when you are ready."
+    }
+  },
+  "colors": {}
+}

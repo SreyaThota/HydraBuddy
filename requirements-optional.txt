@@ -1,0 +1,7 @@
+# HydraBuddy needs NO packages to run - only Python with Tkinter.
+#
+# Optional extras (install with: py -m pip install -r requirements-optional.txt)
+#   pystray + pillow : system-tray icon (without them the app minimises to the taskbar)
+#   pillow           : also used by tools/capture_screenshots.py
+pystray
+pillow
