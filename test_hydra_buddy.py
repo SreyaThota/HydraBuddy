@@ -10,7 +10,10 @@ Tests never touch your real settings.json or Startup folder: they use a
 temporary folder that is deleted afterwards.
 """
 
+import argparse
 import array
+import os
+import subprocess
 import copy
 import io
 import json
@@ -25,6 +28,7 @@ import hydra_buddy as hb
 
 hb.play_reminder_sound = lambda volume=0.6: None     # keep the test run quiet
 hb.log_error = lambda text: None                     # tests trigger errors on purpose; don't log them
+TEST_TASK = f"HydraBuddyTest{os.getpid()}"           # throwaway Task Scheduler name, always deleted
 
 
 class FakeClock:
@@ -176,10 +180,11 @@ class AppTestBase(unittest.TestCase):
         self.app = hb.HydraBuddyApp(self.root, settings, use_tray=False, clock=self.clock,
                                     auto_tick=False, lock_check=lambda: self.locked,
                                     settings_path=self.folder / "settings.json",
-                                    startup_folder_path=self.folder)
+                                    startup_task_prefix=TEST_TASK)
 
     def tearDown(self):
         self.app.exit_app()
+        hb.remove_startup(TEST_TASK)
         self.tmp.cleanup()
 
     def popups(self):
@@ -336,13 +341,33 @@ class AppTests(AppTestBase):
         saved = json.loads((self.folder / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["theme"], list(hb.THEMES)[-1])
 
-    def test_startup_checkbox_creates_and_removes_shortcut(self):
+    def test_startup_checkbox_creates_and_removes_tasks(self):
         self.app.set_startup(True)
-        self.assertTrue((self.folder / hb.STARTUP_SHORTCUT_NAME).exists())
+        self.assertTrue(hb.is_startup_installed(TEST_TASK))
+        self.assertTrue(hb.is_startup_installed(TEST_TASK + hb.KEEPALIVE_SUFFIX))
         self.assertTrue(self.app.startup_var.get())
         self.app.set_startup(False)
-        self.assertFalse((self.folder / hb.STARTUP_SHORTCUT_NAME).exists())
+        self.assertFalse(hb.is_startup_installed(TEST_TASK))
         self.assertFalse(self.app.startup_var.get())
+
+    def test_exit_button_remembers_exit(self):
+        flag = self.folder / "exited"
+        self.app.exit_flag_path = flag
+        self.app.user_exit()
+        self.assertTrue(flag.exists())
+        self.assertTrue(self.app.closed)
+
+    def test_windows_shutdown_closes_the_app(self):
+        handler = self.root.protocol("WM_SAVE_YOURSELF")
+        self.assertTrue(handler)
+        self.root.tk.call(handler)
+        self.assertTrue(self.app.closed)
+
+    def test_sleep_detected_by_wall_clock_too(self):
+        self.clock.advance(1150)
+        self.app._last_loop_wall -= 3600      # wall clock says an hour passed, monotonic did not
+        self.app._tick_loop()
+        self.assertAlmostEqual(self.app.timer.remaining(), 1200)
 
     def test_reload_settings_from_file(self):
         (self.folder / "settings.json").write_text(json.dumps({"interval_minutes": 10, "theme": "dark"}))
@@ -442,7 +467,7 @@ class RealTimeTest(unittest.TestCase):
             root.withdraw()
             app = hb.HydraBuddyApp(root, interval_seconds=2, snooze_seconds=1, use_tray=False,
                                    lock_check=lambda: False, settings_path=Path(folder) / "s.json",
-                                   startup_folder_path=folder)
+                                   startup_task_prefix=TEST_TASK)
             try:
                 end = time.monotonic() + 3.5
                 while time.monotonic() < end and not app.popup_is_open():
@@ -477,7 +502,7 @@ class SoundTest(unittest.TestCase):
                 settings = hb.validate_settings({"sound_enabled": False}, [])
                 app = hb.HydraBuddyApp(root, settings, use_tray=False, auto_tick=False,
                                        lock_check=lambda: False, settings_path=Path(folder) / "s.json",
-                                       startup_folder_path=folder)
+                                       startup_task_prefix=TEST_TASK)
                 app.show_reminder()
                 app.exit_app()
                 self.assertEqual(calls, [])
@@ -485,15 +510,96 @@ class SoundTest(unittest.TestCase):
             hb.play_reminder_sound = lambda volume=0.6: None
 
 
-class StartupShortcutTest(unittest.TestCase):
-    def test_install_and_remove_in_temp_folder(self):
+class StartupTaskTest(unittest.TestCase):
+    """Creates real scheduled tasks under a throwaway name, checks them, and deletes them."""
+
+    def tearDown(self):
+        hb.remove_startup(TEST_TASK)
+
+    def xml(self, name):
+        return subprocess.run(["schtasks", "/Query", "/TN", name, "/XML"], capture_output=True,
+                              text=True).stdout
+
+    def test_tasks_have_the_right_triggers_and_no_time_limit(self):
+        names = hb.install_startup(TEST_TASK)
+        self.assertEqual(names, [TEST_TASK, TEST_TASK + hb.KEEPALIVE_SUFFIX])
+        signin, keepalive = self.xml(names[0]), self.xml(names[1])
+        self.assertIn("<LogonTrigger>", signin)
+        self.assertIn("--autostart", signin)
+        self.assertIn("<SessionStateChangeTrigger>", keepalive)
+        self.assertIn("<StateChange>SessionUnlock</StateChange>", keepalive)
+        self.assertIn("<Interval>PT15M</Interval>", keepalive)
+        self.assertIn("--keepalive", keepalive)
+        for xml in (signin, keepalive):
+            self.assertIn("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", xml)   # never stopped after 3 days
+            self.assertIn("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>", xml)
+            self.assertIn("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", xml)
+            self.assertIn("pythonw.exe", xml)
+        self.assertTrue(hb.remove_startup(TEST_TASK))
+        self.assertFalse(hb.is_startup_installed(TEST_TASK))
+        self.assertFalse(hb.is_startup_installed(TEST_TASK + hb.KEEPALIVE_SUFFIX))
+        self.assertFalse(hb.remove_startup(TEST_TASK))
+
+
+class LaunchDecisionTest(unittest.TestCase):
+    def args(self, **kw):
+        base = dict(keepalive=False, autostart=False, restarted=False)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_exit_is_respected_until_next_sign_in(self):
         with tempfile.TemporaryDirectory() as folder:
-            shortcut = hb.install_startup(folder)
-            self.assertTrue(Path(shortcut).exists())
-            self.assertTrue(hb.is_startup_installed(folder))
-            self.assertTrue(hb.remove_startup(folder))
-            self.assertFalse(Path(shortcut).exists())
-            self.assertFalse(hb.remove_startup(folder))
+            flag = Path(folder) / "exited"
+            flag.write_text("x")
+            self.assertFalse(hb.should_start(self.args(keepalive=True), flag))   # unlock: stay closed
+            self.assertTrue(flag.exists())
+            self.assertTrue(hb.should_start(self.args(autostart=True), flag))    # sign-in: start again
+            self.assertFalse(flag.exists())
+            self.assertTrue(hb.should_start(self.args(keepalive=True), flag))    # later unlocks: start
+
+    def test_started_by_hand_clears_exit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            flag = Path(folder) / "exited"
+            flag.write_text("x")
+            self.assertTrue(hb.should_start(self.args(), flag))
+            self.assertFalse(flag.exists())
+
+
+class WatchdogTest(unittest.TestCase):
+    def make(self):
+        self.mono, self.wall, self.hangs = [1000.0], [5000.0], []
+        return hb.Watchdog(hang_seconds=60, on_hang=self.hangs.append,
+                           mono=lambda: self.mono[0], wall=lambda: self.wall[0])
+
+    def step(self, dog, seconds, wall_extra=0, beat=False):
+        self.mono[0] += seconds
+        self.wall[0] += seconds + wall_extra
+        if beat:
+            dog.beat()
+        return dog.check()
+
+    def test_healthy_app_is_left_alone(self):
+        dog = self.make()
+        for _ in range(100):
+            self.assertFalse(self.step(dog, 5, beat=True))
+        self.assertEqual(self.hangs, [])
+
+    def test_frozen_app_is_detected(self):
+        dog = self.make()
+        results = [self.step(dog, 5) for _ in range(13)]       # 65 s without a heartbeat
+        self.assertTrue(results[-1])
+        self.assertEqual(len(self.hangs), 1)
+
+    def test_sleep_is_not_mistaken_for_a_freeze(self):
+        dog = self.make()
+        self.step(dog, 5, beat=True)
+        self.assertFalse(self.step(dog, 5, wall_extra=3600))    # laptop slept for an hour
+        for _ in range(4):
+            self.assertFalse(self.step(dog, 5))                # just woke up: no heartbeat yet
+        self.assertEqual(self.hangs, [])
+        for _ in range(9):
+            self.step(dog, 5)                                  # still nothing 65 s after waking
+        self.assertEqual(len(self.hangs), 1)
 
 
 if __name__ == "__main__":

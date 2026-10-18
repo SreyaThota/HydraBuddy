@@ -22,6 +22,7 @@ are installed (py -m pip install -r requirements-optional.txt).
 import argparse
 import array
 import copy
+import faulthandler
 import ctypes
 import io
 import json
@@ -47,7 +48,12 @@ APP_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "settings.json"        # your personal settings
 LOG_FILE = APP_DIR / "hydra_buddy.log"           # errors are written here
 CUSTOM_SOUND_FILE = APP_DIR / "reminder.wav"     # optional: your own sound
-STARTUP_SHORTCUT_NAME = "HydraBuddy.lnk"
+STARTUP_SHORTCUT_NAME = "HydraBuddy.lnk"         # old start-up method (removed when upgrading)
+TASK_NAME = "HydraBuddy"                         # Task Scheduler: starts it when you sign in
+KEEPALIVE_SUFFIX = "-KeepAlive"                  # Task Scheduler: restarts it on unlock / every 15 min
+KEEPALIVE_MINUTES = 15
+EXIT_FLAG_FILE = APP_DIR / ".exited-by-user"     # remembers that you clicked Exit (until next sign-in)
+HANG_SECONDS = 60                                # frozen this long = restart automatically
 
 TEST_INTERVAL_SECONDS = 30     # interval used with --test
 TEST_SNOOZE_SECONDS = 10       # snooze used with --test
@@ -962,7 +968,7 @@ class TrayIcon:
                 lambda item: "Resume reminders" if app.timer.state == ReminderTimer.PAUSED else "Pause reminders",
                 lambda: app.post(app.toggle_pause)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Exit HydraBuddy", lambda: app.post(app.exit_app)),
+            pystray.MenuItem("Exit HydraBuddy", lambda: app.post(app.user_exit)),
         )
         self.icon = pystray.Icon(APP_NAME, self._make_image(), APP_NAME, menu)
         self.thread = threading.Thread(target=self.icon.run, daemon=True)
@@ -1000,10 +1006,13 @@ class HydraBuddyApp:
 
     def __init__(self, root, settings=None, interval_seconds=None, snooze_seconds=None,
                  use_tray=True, start_minimized=False, clock=time.monotonic, auto_tick=True,
-                 lock_check=None, settings_path=None, startup_folder_path=None):
+                 lock_check=None, settings_path=None, startup_task_prefix=TASK_NAME,
+                 exit_flag_path=None):
         self.root = root
         self.settings_path = Path(settings_path) if settings_path else SETTINGS_FILE
-        self.startup_folder_path = startup_folder_path
+        self.startup_task_prefix = startup_task_prefix
+        self.exit_flag_path = exit_flag_path      # only set by main(); tests leave it off
+        self.watchdog = None                      # started by main()
         self.settings = settings if settings is not None else validate_settings({}, [])
         # --test or --interval-seconds fix the interval (the menu is then disabled).
         self.fixed_interval = interval_seconds
@@ -1015,6 +1024,7 @@ class HydraBuddyApp:
         self.is_locked = lock_check or is_screen_locked
         self._was_locked = False
         self._last_loop_time = time.monotonic()
+        self._last_loop_wall = time.time()
         self.timer = ReminderTimer(self.interval, clock)
         self.popup = None
         self.toast = None
@@ -1034,6 +1044,8 @@ class HydraBuddyApp:
         root.title("HydraBuddy")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.hide_to_background)
+        # Windows is shutting down or signing out: close straight away so we never hold it up.
+        root.protocol("WM_SAVE_YOURSELF", lambda: self.exit_app(reason="Windows is shutting down / signing out"))
 
         self.state_text = tk.StringVar()
         self.countdown_text = tk.StringVar()
@@ -1124,15 +1136,15 @@ class HydraBuddyApp:
     def set_startup(self, enabled):
         try:
             if enabled:
-                install_startup(self.startup_folder_path)
+                install_startup(self.startup_task_prefix)
                 self.show_toast("HydraBuddy will now start when you sign in.")
             else:
-                remove_startup(self.startup_folder_path)
+                remove_startup(self.startup_task_prefix)
                 self.show_toast("HydraBuddy will no longer start with Windows.")
         except (OSError, subprocess.CalledProcessError) as exc:
             self.report_problem(f"Could not change the startup setting ({exc}).")
         if self.main_frame is not None:
-            self.startup_var.set(is_startup_installed(self.startup_folder_path))
+            self.startup_var.set(is_startup_installed(self.startup_task_prefix))
 
     def edit_settings_file(self):
         if not self.settings_path.exists():
@@ -1198,7 +1210,7 @@ class HydraBuddyApp:
         row2.pack(padx=14, pady=4)
         self._button(row2, "Remind me now", self.show_reminder, "secondary")
         self._button(row2, "Run in background", self.hide_to_background, "secondary")
-        self._button(row2, "Exit", self.exit_app, "secondary")
+        self._button(row2, "Exit", self.user_exit, "secondary")
 
         # Personalise section
         box = tk.Frame(f, bg=t["status_bg"])
@@ -1235,7 +1247,7 @@ class HydraBuddyApp:
         tk.Checkbutton(box, text="Sound", variable=self.sound_var,
                        command=lambda: self.set_sound(self.sound_var.get()), **check).grid(
             row=2, column=0, sticky="w", padx=6, pady=4)
-        self.startup_var = tk.BooleanVar(value=is_startup_installed(self.startup_folder_path))
+        self.startup_var = tk.BooleanVar(value=is_startup_installed(self.startup_task_prefix))
         tk.Checkbutton(box, text="Start with Windows", variable=self.startup_var,
                        command=lambda: self.set_startup(self.startup_var.get()), **check).grid(
             row=2, column=1, columnspan=3, sticky="w", pady=4)
@@ -1329,11 +1341,15 @@ class HydraBuddyApp:
         self._tick_id = None
         if self.closed:
             return
-        now = time.monotonic()
-        if now - self._last_loop_time > SLEEP_GAP_SECONDS:
-            # The loop runs twice a second, so a long gap means the laptop was asleep.
+        now, wall = time.monotonic(), time.time()
+        # The loop runs twice a second, so a long gap means the laptop was asleep.
+        # Both clocks are checked: on some PCs the monotonic clock pauses during sleep.
+        gap = max(now - self._last_loop_time, wall - self._last_loop_wall)
+        if gap > SLEEP_GAP_SECONDS:
             self.welcome_back()
-        self._last_loop_time = now
+        self._last_loop_time, self._last_loop_wall = now, wall
+        if self.watchdog is not None:
+            self.watchdog.beat()
         self.tick()
         self._tick_id = self.root.after(self.TICK_MS, self._tick_loop)
 
@@ -1436,11 +1452,22 @@ class HydraBuddyApp:
             self._told_about_background = True
             self.show_toast(f"Still running! {where}.")
 
-    def exit_app(self):
+    def user_exit(self):
+        """The Exit button / tray menu: quit, and stay closed until the next sign-in."""
+        if self.exit_flag_path is not None:
+            try:
+                Path(self.exit_flag_path).write_text("Exit was clicked. Deleted at the next sign-in.\n")
+            except OSError:
+                pass
+        self.exit_app(reason="Exit clicked")
+
+    def exit_app(self, reason="closed"):
         """Stop everything cleanly: timers, pop-ups, tray icon, window."""
         if self.closed:
             return
         self.closed = True
+        if self.watchdog is not None:
+            log_error(f"HydraBuddy stopped ({reason}).")
         for after_id in (self._tick_id, self._queue_id):
             if after_id is not None:
                 try:
@@ -1463,54 +1490,172 @@ class HydraBuddyApp:
 
 
 # ---------------------------------------------------------------------------
-# Optional: start HydraBuddy automatically when you sign in to Windows
+# Watchdog: if the window ever freezes, record why and restart automatically
 # ---------------------------------------------------------------------------
+class Watchdog:
+    """Runs in a background thread and checks that the timer loop is still alive.
+
+    The timer loop calls beat() twice a second. If no beat arrives for
+    HANG_SECONDS while the laptop is awake, the app is frozen: the watchdog
+    writes what every thread was doing into hydra_buddy.log, starts a fresh
+    copy of HydraBuddy, and ends the frozen one.
+    """
+
+    CHECK_EVERY = 5   # seconds between checks
+
+    def __init__(self, hang_seconds=HANG_SECONDS, on_hang=None,
+                 mono=time.monotonic, wall=time.time):
+        self.hang_seconds = hang_seconds
+        self.on_hang = on_hang or self._restart
+        self.mono, self.wall = mono, wall
+        self.heartbeat = mono()
+        self.awake_since = mono()
+        self._last_mono, self._last_wall = mono(), wall()
+        self.stopped = False
+
+    def beat(self):
+        self.heartbeat = self.mono()
+
+    def check(self):
+        """One check. Returns True (and calls on_hang) if the app is frozen."""
+        now, wall = self.mono(), self.wall()
+        gap = max(now - self._last_mono, wall - self._last_wall)
+        self._last_mono, self._last_wall = now, wall
+        if gap > self.CHECK_EVERY * 4:
+            # The laptop was asleep: give the app time to wake up before judging it.
+            self.awake_since = now
+            self.heartbeat = now
+            return False
+        frozen_for = now - self.heartbeat
+        if frozen_for > self.hang_seconds and now - self.awake_since > self.hang_seconds:
+            self.on_hang(frozen_for)
+            return True
+        return False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True, name="watchdog").start()
+
+    def _run(self):
+        while not self.stopped:
+            time.sleep(self.CHECK_EVERY)
+            if not self.stopped and self.check():
+                return
+
+    @staticmethod
+    def _restart(frozen_for):
+        log_error(f"HydraBuddy was frozen for {frozen_for:.0f} s. What each part was doing:")
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                faulthandler.dump_traceback(file=f, all_threads=True)
+        except OSError:
+            pass
+        try:
+            subprocess.Popen([str(pythonw_path()), str(Path(__file__).resolve()), "--minimized", "--restarted"],
+                             cwd=str(APP_DIR), close_fds=True,
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                             | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            log_error("Started a fresh copy of HydraBuddy.")
+        except OSError as exc:
+            log_error(f"Could not restart HydraBuddy ({exc}).")
+        os._exit(3)
+
+
+# ---------------------------------------------------------------------------
+# Start with Windows (Task Scheduler)
+#
+# Two scheduled tasks are created for your Windows user:
+#   "HydraBuddy"            - starts it when you sign in
+#   "HydraBuddy-KeepAlive"  - starts it again when you unlock the laptop
+#                             (also after sleep) and checks every 15 minutes,
+#                             in case it was closed by Windows or crashed.
+# If HydraBuddy is already running, the extra start just quits quietly.
+# If you clicked Exit, it stays closed until your next sign-in.
+# ---------------------------------------------------------------------------
+def pythonw_path():
+    """pythonw.exe runs Python without a black console window."""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return pythonw if pythonw.exists() else Path(sys.executable)
+
+
+def _run_powershell(command):
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                          capture_output=True, text=True,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def startup_folder():
     return Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 
-def is_startup_installed(folder=None):
-    try:
-        folder = Path(folder) if folder else startup_folder()
-    except KeyError:
+def is_startup_installed(prefix=TASK_NAME):
+    if os.name != "nt":
         return False
-    return (folder / STARTUP_SHORTCUT_NAME).exists()
+    result = subprocess.run(["schtasks", "/Query", "/TN", prefix], capture_output=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return result.returncode == 0
 
 
-def install_startup(folder=None):
-    """Create a shortcut in the Windows Startup folder. Returns its path."""
-    folder = Path(folder) if folder else startup_folder()
-    shortcut = folder / STARTUP_SHORTCUT_NAME
-    pythonw = Path(sys.executable).with_name("pythonw.exe")   # runs without a console window
-    if not pythonw.exists():
-        pythonw = Path(sys.executable)
+def install_startup(prefix=TASK_NAME):
+    """Create (or update) the two scheduled tasks. Returns their names."""
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ['USERNAME']}".lstrip("\\")
     script = Path(__file__).resolve()
+    q = _ps_quote
+    argument = q(f'"{script}" --minimized ')
+    command = f"""
+$ErrorActionPreference = 'Stop'
+$user = {q(user)}
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+function Action($mode) {{
+    New-ScheduledTaskAction -Execute {q(pythonw_path())} -WorkingDirectory {q(script.parent)} -Argument ({argument} + $mode)
+}}
+$atLogon = New-ScheduledTaskTrigger -AtLogOn -User $user
+Register-ScheduledTask -TaskName {q(prefix)} -Action (Action '--autostart') -Trigger $atLogon `
+    -Settings $settings -Principal $principal -Force `
+    -Description 'Starts HydraBuddy (break reminder) when you sign in.' | Out-Null
 
-    def ps_quote(value):
-        return "'" + str(value).replace("'", "''") + "'"
+$unlockClass = Get-CimClass -Namespace ROOT\\Microsoft\\Windows\\TaskScheduler -ClassName MSFT_TaskSessionStateChangeTrigger
+$onUnlock = New-CimInstance -CimClass $unlockClass -ClientOnly -Property @{{ StateChange = 8; UserId = $user; Enabled = $true }}
+$every = New-ScheduledTaskTrigger -AtLogOn -User $user
+$every.Delay = 'PT5M'
+$every.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes {KEEPALIVE_MINUTES})).Repetition
+Register-ScheduledTask -TaskName {q(prefix + KEEPALIVE_SUFFIX)} -Action (Action '--keepalive') `
+    -Trigger $onUnlock, $every -Settings $settings -Principal $principal -Force `
+    -Description 'Restarts HydraBuddy after unlocking or if it was closed by Windows.' | Out-Null
+"""
+    result = _run_powershell(command)
+    if result.returncode != 0:
+        raise OSError(f"Task Scheduler refused: {result.stderr.strip()[:300]}")
+    if prefix == TASK_NAME:
+        # Upgrade from the old Startup-folder shortcut, so it doesn't start twice.
+        try:
+            (startup_folder() / STARTUP_SHORTCUT_NAME).unlink(missing_ok=True)
+        except (OSError, KeyError):
+            pass
+    return [prefix, prefix + KEEPALIVE_SUFFIX]
 
-    arguments = f'"{script}" --minimized'
-    command = (
-        f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut({ps_quote(shortcut)}); "
-        f"$s.TargetPath = {ps_quote(pythonw)}; "
-        f"$s.Arguments = {ps_quote(arguments)}; "
-        f"$s.WorkingDirectory = {ps_quote(script.parent)}; "
-        f"$s.Description = 'HydraBuddy break reminder'; "
-        f"$s.Save()"
-    )
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                   check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return shortcut
 
-
-def remove_startup(folder=None):
-    """Delete the Startup-folder shortcut. Returns True if one was removed."""
-    folder = Path(folder) if folder else startup_folder()
-    shortcut = folder / STARTUP_SHORTCUT_NAME
-    if shortcut.exists():
-        shortcut.unlink()
-        return True
-    return False
+def remove_startup(prefix=TASK_NAME):
+    """Delete the scheduled tasks (and any old shortcut). Returns True if something was removed."""
+    removed = False
+    for name in (prefix, prefix + KEEPALIVE_SUFFIX):
+        if is_startup_installed(name):
+            _run_powershell(f"Unregister-ScheduledTask -TaskName {_ps_quote(name)} -Confirm:$false")
+            removed = True
+    if prefix == TASK_NAME:
+        try:
+            old = startup_folder() / STARTUP_SHORTCUT_NAME
+            if old.exists():
+                old.unlink()
+                removed = True
+        except (OSError, KeyError):
+            pass
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -1524,21 +1669,41 @@ def parse_args(argv=None):
                    help="custom interval in seconds for this run only (e.g. 900 = 15 minutes)")
     p.add_argument("--minimized", action="store_true", help="start hidden in the background")
     p.add_argument("--no-tray", action="store_true", help="do not create a tray icon")
-    p.add_argument("--install-startup", action="store_true", help="start HydraBuddy when you sign in to Windows")
-    p.add_argument("--remove-startup", action="store_true", help="stop starting HydraBuddy with Windows")
+    p.add_argument("--install-startup", action="store_true",
+                   help="start HydraBuddy when you sign in, and again after unlocking")
+    p.add_argument("--remove-startup", action="store_true", help="stop starting HydraBuddy automatically")
+    # Used by the scheduled tasks and the watchdog (you don't need these yourself):
+    p.add_argument("--autostart", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--keepalive", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--restarted", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args(argv)
+
+
+def should_start(args, exit_flag=EXIT_FLAG_FILE):
+    """Decide whether this launch should run, based on why it was started."""
+    if args.keepalive:
+        return not Path(exit_flag).exists()      # you clicked Exit: respect it until next sign-in
+    try:
+        Path(exit_flag).unlink(missing_ok=True)  # sign-in or started by hand: forget the old Exit
+    except OSError:
+        pass
+    return True
 
 
 def main(argv=None):
     args = parse_args(argv)
 
     if args.install_startup:
-        path = install_startup()
-        print(f"Done! HydraBuddy will start when you sign in.\nShortcut: {path}")
+        names = install_startup()
+        print("Done! HydraBuddy will start when you sign in and come back after you unlock.\n"
+              f"Scheduled tasks: {', '.join(names)}")
         return 0
     if args.remove_startup:
         removed = remove_startup()
-        print("Startup shortcut removed." if removed else "No startup shortcut was found.")
+        print("Automatic start removed." if removed else "Automatic start was not set up.")
+        return 0
+
+    if not should_start(args):
         return 0
 
     interval = snooze = None
@@ -1549,7 +1714,14 @@ def main(argv=None):
 
     enable_dpi_awareness()
 
-    if not acquire_single_instance():
+    # A restarted copy waits a moment for the frozen one to finish closing.
+    deadline = time.monotonic() + (20 if args.restarted else 0)
+    while not acquire_single_instance():
+        if time.monotonic() < deadline:
+            time.sleep(0.5)
+            continue
+        if args.minimized:
+            return 0                              # started automatically: already running, all good
         root = tk.Tk()
         root.withdraw()
         messagebox.showinfo(APP_NAME, "HydraBuddy is already running.\n\n"
@@ -1557,14 +1729,22 @@ def main(argv=None):
         root.destroy()
         return 1
 
+    why = ("sign-in" if args.autostart else "unlock / keep-alive" if args.keepalive
+           else "restart after freeze" if args.restarted else "started by hand")
+    log_error(f"HydraBuddy started ({why}).")
     settings, problems = load_settings()
     root = tk.Tk()
     try:
         app = HydraBuddyApp(root, settings, interval_seconds=interval, snooze_seconds=snooze,
-                            use_tray=not args.no_tray, start_minimized=args.minimized)
+                            use_tray=not args.no_tray, start_minimized=args.minimized,
+                            exit_flag_path=EXIT_FLAG_FILE)
+        app.watchdog = Watchdog()
+        app.watchdog.start()
         for problem in problems:
             app.report_problem(problem)
         root.mainloop()
+        if not app.closed:
+            log_error("HydraBuddy stopped (window closed).")
     except Exception:
         log_error(traceback.format_exc())
         raise

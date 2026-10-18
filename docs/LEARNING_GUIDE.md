@@ -96,7 +96,23 @@ win.attributes("-transparentcolor", TRANSPARENT_KEY)   # that colour becomes see
 
 - **Closing ≠ quitting.** `root.protocol("WM_DELETE_WINDOW", self.hide_to_background)` means the window's X button just hides the window: `withdraw()` if there's a tray icon, `iconify()` (minimise) if not. The `after()` loop keeps running, so reminders continue.
 - **Only one copy:** `acquire_single_instance()` creates a Windows *named mutex* called `HydraBuddy_SingleInstance`. If Windows says the name already exists (error 183), another copy is running, so this one shows a message and exits.
-- **Start with Windows:** `install_startup()` asks PowerShell to create a `.lnk` shortcut in your Startup folder. It points to `pythonw.exe` (Python without a console window) with `--minimized`.
+- **Start with Windows:** `install_startup()` asks PowerShell to register two **scheduled tasks**. Both run `pythonw.exe` (Python without a console window) with `--minimized`:
+  - `HydraBuddy` runs at sign-in (`--autostart`).
+  - `HydraBuddy-KeepAlive` runs on every unlock and every 15 minutes (`--keepalive`).
+
+  Both have no time limit (`PT0S`), so Windows never stops them after 3 days. Both also run on battery. `should_start()` decides what each launch does:
+  - A keep-alive launch stays away if you clicked **Exit** (the `.exited-by-user` file).
+  - A sign-in clears that file.
+  - If HydraBuddy is already running, a background launch quietly quits.
+
+  *Why not the Startup folder?* It only runs at a full sign-in. Waking a laptop from sleep isn't a sign-in, so once the app was closed, it never came back.
+- **Watchdog:** `Watchdog` is a background thread that checks a *heartbeat*, which `_tick_loop()` updates twice a second. If there's no heartbeat for 60 seconds while the laptop is awake, the app is frozen. The watchdog then:
+  1. Writes every thread's current line to `hydra_buddy.log` (`faulthandler.dump_traceback`).
+  2. Starts a fresh copy with `--restarted`, which waits for the old copy to finish.
+  3. Ends the frozen copy.
+
+  Sleep is detected by a big jump in the wall clock, so a sleeping laptop isn't mistaken for a frozen app.
+- **Windows shutdown:** `root.protocol("WM_SAVE_YOURSELF", ...)` closes the app as soon as Windows asks, so it never holds up shutdown.
 - **Tray icon (optional):** `pystray` needs its own thread. Tkinter must only be touched from its own thread, so tray clicks call `app.post(func)`, which puts `func` on a `queue.Queue`. `_process_calls()` (run by `after()` every 200 ms) takes jobs off the queue and runs them safely.
 - **Sound:** `make_chime_wav()` calculates three fading sine waves (C, E, G) and packs them into WAV bytes. `winsound.PlaySound` plays them on a helper thread, so the window doesn't freeze for 1.5 seconds. Windows applies your system volume on top.
 
@@ -138,12 +154,14 @@ What each button does to the timer:
 | **Start / Restart** | Starts a fresh full interval |
 | Lock, then unlock / sleep, then wake | Closes any pop-up and starts a fresh full interval (unless paused) |
 | Close the main window | Nothing: the timer keeps running in the background |
-| **Exit** | Everything stops |
+| **Exit** | Everything stops. It stays closed until your next sign-in (keep-alive launches respect this) |
+| Windows shuts down or signs out | Closes immediately |
+| The window freezes for 60 s | The watchdog logs why, starts a fresh copy, and ends the frozen one |
 
 ## 7. How to test without waiting 20 minutes
 
 - **By hand:** `py hydra_buddy.py --test` (a reminder every 30 seconds, snooze 10 seconds). Or click **Remind me now**.
-- **Automated:** `py -m unittest -v test_hydra_buddy.py` runs 47 tests.
+- **Automated:** `py -m unittest -v test_hydra_buddy.py` runs 55 tests.
   - `FakeClock` replaces `time.monotonic`. Calling `self.clock.advance(1200)` "waits" 20 minutes instantly.
   - `lock_check=lambda: self.locked` lets a test pretend the laptop is locked.
   - `settings_path` and `startup_folder_path` point to a temporary folder, so tests never touch your real files.
@@ -200,7 +218,7 @@ Keep this up to date, and only tick the boxes in the last section when they're t
 - Decided to publish it, and wrote the motivation and story.
 
 **What Claude Code generated**
-- Nearly all of the Python code, the 47 tests, the screenshot script, the README, this guide, and the first drafts of the LinkedIn posts.
+- Nearly all of the Python code, the 55 tests, the screenshot script, the README, this guide, and the first drafts of the LinkedIn posts.
 - The diagnosis of the sound issue: Windows was sending audio to an external HDMI display.
 - The verification runs: the test suite, real-time runs in test mode, and screenshots of the real app.
 
@@ -210,7 +228,7 @@ Before starting, exit the background copy (tray icon → *Exit HydraBuddy*, or t
 
 | # | Do this | You should see |
 |---|---|---|
-| ☐ 1 | `py -m unittest -v test_hydra_buddy.py` | `Ran 47 tests` … `OK` |
+| ☐ 1 | `py -m unittest -v test_hydra_buddy.py` | `Ran 55 tests` … `OK` |
 | ☐ 2 | `py hydra_buddy.py --test` | The main window, counting down from 00:30 |
 | ☐ 3 | Wait 30 seconds, working in another app | The pop-up appears in the centre, above your other app, with the chime |
 | ☐ 4 | Click **Look far: start 20s** | The button counts down 20 → 1, then shows "Eyes relaxed ✓" |
@@ -224,6 +242,7 @@ Before starting, exit the background copy (tray icon → *Exit HydraBuddy*, or t
 | ☐ 12 | Press `Win + L` while it's running, then unlock | "Welcome back!" message; the countdown restarts |
 | ☐ 13 | Run `py hydra_buddy.py --test` a second time while it's open | "HydraBuddy is already running" |
 | ☐ 14 | Restart the laptop (with **Start with Windows** ticked) | HydraBuddy starts by itself in the tray/taskbar |
+| ☐ 14b | Right-click the tray icon → *Exit*, lock with `Win + L`, unlock | It stays closed (you chose Exit). After your next sign-in, it's back |
 | ☐ 15 | Click **Exit** | Everything closes: window, tray icon and pop-ups |
 | ☐ 16 | Explain sections 2, 3 and 4 of this guide out loud without reading | You can 🙂 |
 

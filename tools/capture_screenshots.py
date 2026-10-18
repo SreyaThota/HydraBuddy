@@ -60,7 +60,7 @@ def grab_window(root, win, name):
 def make_app(root, settings, folder):
     return hb.HydraBuddyApp(root, settings, use_tray=False, auto_tick=False,
                             lock_check=lambda: False, settings_path=Path(folder) / "settings.json",
-                            startup_folder_path=folder)
+                            startup_task_prefix="HydraBuddyScreenshot")
 
 
 def make_banner(popup_image):

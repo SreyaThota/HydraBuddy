@@ -35,7 +35,8 @@ The point isn't to build something complicated. It's to notice a small everyday 
 - ✅ **Switch reminders on or off individually.**
 - ⏸️ **Pause / Resume / Restart**, plus "Remind me now".
 - 🔒 **Respects when you're away:** no pop-ups on the lock screen, and the countdown restarts when you unlock or wake the laptop.
-- 🚀 **Start with Windows** checkbox.
+- 🚀 **Start with Windows** checkbox: starts at sign-in, and comes back after unlocking if it was closed.
+- 🩺 **Self-healing:** if the window ever freezes, the problem is written to the log and HydraBuddy restarts itself.
 - 📌 **Optional tray icon** with a right-click menu (needs two optional packages).
 - 📴 **100% offline:** no network code, no accounts, no data collection.
 
@@ -97,9 +98,16 @@ Test mode reminds you every **30 seconds** (snooze is 10 seconds) and doesn't ch
 
 ### Start automatically with Windows
 
-Tick **Start with Windows** in the main window. This adds a shortcut to your Windows Startup folder, so HydraBuddy starts quietly in the background each time you sign in. Untick it to remove the shortcut.
+Tick **Start with Windows** in the main window (or run `py hydra_buddy.py --install-startup`). This creates two Windows **scheduled tasks** for your user:
 
-> The shortcut points to the folder HydraBuddy is in. If you move the folder, untick and re-tick the box.
+- **HydraBuddy** starts it quietly in the background when you sign in.
+- **HydraBuddy-KeepAlive** starts it again whenever you **unlock** the laptop (also after sleep), and checks every 15 minutes. That way it comes back if Windows closed it. If it's already running, nothing happens.
+
+Clicking **Exit** keeps HydraBuddy closed until your next sign-in. To pause reminders for a while, use **Pause** instead. Untick **Start with Windows** to remove both tasks.
+
+> Why scheduled tasks and not the Startup folder? Most of the time you wake the laptop from sleep instead of signing in, and the Startup folder only runs at sign-in.
+
+> The tasks point to the folder HydraBuddy is in. If you move the folder, untick and re-tick the box.
 
 ---
 
@@ -171,7 +179,7 @@ For a guided, function-by-function walkthrough, see **[docs/LEARNING_GUIDE.md](d
 ```
 HydraBuddy/
 ├── hydra_buddy.py            # the whole app
-├── test_hydra_buddy.py       # 47 automated tests (unittest)
+├── test_hydra_buddy.py       # 55 automated tests (unittest)
 ├── settings.example.json     # every setting with its default value
 ├── run_hydrabuddy.bat        # double-click launcher (no console window)
 ├── requirements-optional.txt # pystray + pillow, only for the tray icon
@@ -191,15 +199,15 @@ Files created while you use the app (`settings.json`, `hydra_buddy.log`, `remind
 py -m unittest -v test_hydra_buddy.py
 ```
 
-There are 47 tests, covering the timer, pause/resume, snooze, dismiss, the lock and sleep behaviour, settings validation, every theme, custom texts and images, small screens, the startup shortcut and the sound generation. Most tests use a fake clock, so "20 minutes" passes instantly. The tests use a temporary folder and never change your real settings or Startup folder.
+There are 55 tests, covering the timer, pause/resume, snooze, dismiss, the lock and sleep behaviour, settings validation, every theme, custom texts and images, small screens, the start-up tasks, the freeze watchdog, and the sound generation. Most tests use a fake clock, so "20 minutes" passes instantly. The tests use a temporary folder and never change your real settings. The start-up test creates scheduled tasks under a throwaway name and always deletes them.
 
 ### What has been tested, and how
 
 | How | What |
 |---|---|
-| **Automated tests** (47, all passing) | Timer logic, every button's effect on the timer, no duplicate pop-ups, settings loading/validation/saving, all 4 themes, custom texts/colours/images, small-screen fitting, startup shortcut creation (in a temporary folder), chime generation. Locking and sleep are **simulated** in these tests. |
-| **Real runs on the author's laptop** (Windows 11, Python 3.14) | A fresh clone runs and the pop-up appears after 30 s in `--test` mode. `run_hydrabuddy.bat` starts it without a console. The Start-with-Windows shortcut launches it in the background. The tray icon starts. Windows played the chime. |
-| **Not tested yet** | A real lock/unlock and sleep/wake cycle, Windows 10, multiple monitors, Python versions other than 3.14. |
+| **Automated tests** (55, all passing) | Timer logic, every button's effect on the timer, no duplicate pop-ups, settings loading/validation/saving, all 4 themes, custom texts/colours/images, small-screen fitting, start-up tasks (triggers, no time limit, battery), "Exit stays closed until sign-in", freeze detection vs sleep, closing on Windows shutdown, chime generation. Locking and sleep are **simulated** in these tests. |
+| **Real runs on the author's laptop** (Windows 11, Python 3.14) | A fresh clone runs and the pop-up appears after 30 s in `--test` mode. `run_hydrabuddy.bat` starts it without a console. The scheduled task starts it in the background, and a second trigger while it's running does nothing. A deliberately frozen copy was detected, logged and restarted by the watchdog. The tray icon starts. Windows played the chime. |
+| **Not tested yet** | A real sign-in after a restart, a real lock/unlock and sleep/wake cycle, Windows 10, multiple monitors, Python versions other than 3.14. |
 
 ## How I built it (and how Claude Code helped)
 
@@ -209,12 +217,12 @@ Because I don't want to publish code I can't explain, the [learning guide](docs/
 
 ## Known limitations
 
-- **Windows only.** Lock detection, the single-instance check, the startup shortcut and the sound all use Windows features. The core timer and pop-up are plain Tkinter, but it hasn't been tested on macOS or Linux.
+- **Windows only.** Lock detection, the single-instance check, the start-up tasks and the sound all use Windows features. The core timer and pop-up are plain Tkinter, but it hasn't been tested on macOS or Linux.
 - The pop-up appears on the **main monitor** only.
 - **Full-screen games or videos** can cover the pop-up.
 - The pop-up doesn't take keyboard focus (by design), so keyboard shortcuts (`Enter` = Done, `Esc` = close) only work after clicking it. The canvas-drawn pop-up isn't readable by screen readers.
 - If Windows sends sound to a monitor without speakers, you won't hear the chime. Choose your speakers from the volume icon in the taskbar.
-- The startup shortcut stores the folder's location, so re-tick **Start with Windows** if you move the folder.
+- The start-up tasks store the folder's location, so re-tick **Start with Windows** if you move the folder.
 
 ## Troubleshooting
 
@@ -225,7 +233,8 @@ Because I don't want to publish code I can't explain, the [learning guide](docs/
 | "HydraBuddy is already running" | It's already open. Check the tray (click the `^` near the clock) or the taskbar. |
 | No sound | Check the volume and the output device (speaker icon → **>** → choose your speakers). Check that `"sound_enabled": true` is set. |
 | My settings don't apply | Save the file in Notepad, then click **Reload settings**. A message will say if something in the file was wrong. |
-| Something else went wrong | Look in `hydra_buddy.log` in the HydraBuddy folder. |
+| It didn't start after I opened my laptop | Check that **Start with Windows** is ticked. If you clicked **Exit** earlier, it stays closed until you next sign in. Start it by hand (or sign out and in) to bring it back. |
+| Something else went wrong | Look in `hydra_buddy.log` in the HydraBuddy folder. It records every start and stop, and what the app was doing if it ever froze. |
 
 ## Uninstall
 

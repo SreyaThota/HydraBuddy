@@ -13,3 +13,6 @@ reminder.wav
 .idea/
 Thumbs.db
 desktop.ini
+
+# Remembers that you clicked Exit (personal)
+.exited-by-user
