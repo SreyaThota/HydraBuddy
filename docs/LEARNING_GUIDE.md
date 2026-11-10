@@ -213,11 +213,11 @@ Keep this up to date, and only tick the boxes in the last section when they're t
 
 **What I (the author) did**
 - Noticed the problem and decided what the app should do: three specific reminders, offline, a cute character, a 20-minute interval, background running, starting with Windows, and sound.
-- Wrote the requirements and prompts for Claude Code, and chose which features to add.
+- Wrote the requirements and prompts for the AI coding assistant, and chose which features to add.
 - Ran the app on my own laptop and reported real problems. For example, I couldn't hear the sound, and I wanted the countdown to start only once I'm back at the laptop.
 - Decided to publish it, and wrote the motivation and story.
 
-**What Claude Code generated**
+**What the AI coding assistant generated**
 - Nearly all of the Python code, the 55 tests, the screenshot script, the README, this guide, and the first drafts of the LinkedIn posts.
 - The diagnosis of the sound issue: Windows was sending audio to an external HDMI display.
 - The verification runs: the test suite, real-time runs in test mode, and screenshots of the real app.

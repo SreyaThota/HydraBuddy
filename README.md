@@ -12,6 +12,12 @@ It is one Python file, it needs no internet, and you can make it look and sound 
   <img src="docs/images/popup-cute.png" alt="The HydraBuddy reminder pop-up in the default 'cute' theme. A cartoon girl in a purple hoodie holds a water bottle. Three cards read: Drink Water, Look Far — 20 Seconds, Stand & Sit. Buttons at the bottom: Look far: start 20s, Done! Next in 20 min, Snooze 5 min." width="620">
 </p>
 
+| | |
+|---|---|
+| **What it is** | One-file Python/Tkinter desktop app for Windows: timed pop-ups for water, eye breaks (20-second countdown) and movement |
+| **Stack** | Python · Tkinter · Windows integration (start-up, lock-screen detection) · pytest |
+| **Quality** | 55 automated tests · self-restarts if the UI freezes · no network code |
+
 ---
 
 ## Why I made it
@@ -209,9 +215,9 @@ There are 55 tests, covering the timer, pause/resume, snooze, dismiss, the lock 
 | **Real runs on the author's laptop** (Windows 11, Python 3.14) | A fresh clone runs and the pop-up appears after 30 s in `--test` mode. `run_hydrabuddy.bat` starts it without a console. The scheduled task starts it in the background, and a second trigger while it's running does nothing. A deliberately frozen copy was detected, logged and restarted by the watchdog. The tray icon starts. Windows played the chime. |
 | **Not tested yet** | A real sign-in after a restart, a real lock/unlock and sleep/wake cycle, Windows 10, multiple monitors, Python versions other than 3.14. |
 
-## How I built it (and how Claude Code helped)
+## How I built it
 
-I built HydraBuddy with **[Claude Code](https://claude.com/claude-code)**, an AI coding assistant. I described what I wanted: an offline Python/Tkinter app, three specific reminders, a cute character, background running, starting with Windows, sound, and personalisation. Claude Code wrote most of the code and the tests and explained the choices. I ran the app on my own laptop, reported what didn't work for me, and asked for changes. For example, I reported that I couldn't hear the sound; we traced it to Windows sending audio to an external HDMI display. I also asked for the pop-up to start counting only once I'm back at my laptop.
+I built HydraBuddy with an AI coding assistant. I described what I wanted: an offline Python/Tkinter app, three specific reminders, a cute character, background running, starting with Windows, sound, and personalisation. The assistant wrote most of the code and the tests and explained the choices. I ran the app on my own laptop, reported what didn't work for me, and asked for changes. For example, I reported that I couldn't hear the sound; we traced it to Windows sending audio to an external HDMI display. I also asked for the pop-up to start counting only once I'm back at my laptop.
 
 Because I don't want to publish code I can't explain, the [learning guide](docs/LEARNING_GUIDE.md) walks through every part of the app in plain English.
 
